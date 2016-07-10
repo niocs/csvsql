@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"io/ioutil"
 	"strings"
+	"bufio"
 	"fmt"
 	"log"
 	"os"
@@ -54,6 +55,22 @@ func TempFileName(_basedir, prefix string) (string,string) {
     return tmpDir, filepath.Join(tmpDir, prefix + hex.EncodeToString(randBytes))
 }
 
+func InsertToDB(db *sql.DB,queries <-chan string, done chan<- bool) {
+	for {
+		query, more := <-queries
+		if more {
+			_, err := db.Exec(query)
+			if err != nil {
+				log.Println(err)
+				panic(err)
+			}
+		} else {
+			done <- true
+			return
+		}
+	}
+}
+
 func main() {
 	sflag.Parse(&opt)
 	if _,err := os.Stat(opt.Load); os.IsNotExist(err) {
@@ -68,7 +85,9 @@ func main() {
 	var fieldNames  string
 	var query       string
 	var interactiveMode = len(opt.Query) == 0
-	
+	var queryChan       = make(chan string, 500)
+	var doneChan        = make(chan bool)
+
 	if opt.MemDB {
 		dbfile = ":memory:"
 	} else {
@@ -88,8 +107,8 @@ func main() {
 		log.Println(err)
 		panic(err)
 	}
-
-	_, err = fmt.Fscanln(fp, &rowStr)
+	fpBuf := bufio.NewReader(fp)
+	rowStr, err = fpBuf.ReadString('\n')
 	if err != nil {
 		log.Println(err)
 		panic(err)
@@ -102,19 +121,15 @@ func main() {
 		fieldsSql  += field + " TEXT"
 		fieldNames += field
 	}
+	go InsertToDB(db, queryChan, doneChan)
 	query = fmt.Sprintf("CREATE TABLE %s (%s);",opt.TableName, fieldsSql)
-	_, err = db.Exec(query)
-	//fmt.Println(query)
-	if err != nil {
-		log.Println(err)
-		panic(err)
-	}
+	queryChan <- query
 	if interactiveMode {
 		fmt.Println("Loading csv into table '"+ opt.TableName + "'")
 	}
 	for {
 		fieldsSql = ""
-		_, err = fmt.Fscanln(fp,&rowStr)
+		rowStr, err = fpBuf.ReadString('\n')
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -128,12 +143,10 @@ func main() {
 			fieldsSql += "\"" + field + "\""
 		}
 		query = "INSERT INTO " + opt.TableName + " VALUES (" + fieldsSql + ");"
-		_, err = db.Exec(query)
-		if err != nil {
-			log.Println(err)
-			panic(err)
-		}
+		queryChan <- query
 	}
+	close(queryChan)
+	<-doneChan
 	if interactiveMode { interactive(db) } else { execQuery(db) }
 }
 
