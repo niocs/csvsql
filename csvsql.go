@@ -23,6 +23,7 @@ var opt = struct {
 	MemDB     bool      "Create DB in :memory: instead of disk. Defaults to false"
 	AskType   bool      "Asks type for each field. Uses TEXT otherwise."
 	TableName string    "Sqlite table name.  Default is t1.|t1"
+	RPI       int       "Rows per insert. Defaults to 100. Reduce if long rows.|100"
 	Query     string    "Query to run. If not provided, enters interactive mode"
 	OutFile   string    "File to write csv output to. Defaults to stdout.|/dev/stdout"
 	OutDelim  string    "Output Delimiter to use. Defaults is comma.|,"
@@ -36,6 +37,7 @@ Usage: csvsql  --Load    <csvfile>
               [--AskType]           #Asks type for each field. Uses TEXT otherwise.
               [--TableName]         #Sqlite table name.  Default is t1.
               [--Query]             #Query to run. If not provided, enters interactive mode.
+              [--RPI]               #Rows per insert. Defaults to 100. Reduce if long rows.
               [--OutFile]           #File to write csv output to. Defaults to stdout.
               [--OutDelim]          #Output Delimiter to use. Defaults is comma.
               [--WorkDir <workdir>] #tmp dir to create db in. Defaults to /tmp/. 
@@ -56,15 +58,21 @@ func TempFileName(_basedir, prefix string) (string,string) {
 }
 
 func InsertToDB(db *sql.DB,queries <-chan string, done chan<- bool) {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Println(err)
+		panic(err)
+	}
 	for {
 		query, more := <-queries
 		if more {
-			_, err := db.Exec(query)
+			_, err := tx.Exec(query)
 			if err != nil {
 				log.Println(err)
 				panic(err)
 			}
 		} else {
+			tx.Commit()
 			done <- true
 			return
 		}
@@ -127,9 +135,11 @@ func main() {
 	if interactiveMode {
 		fmt.Println("Loading csv into table '"+ opt.TableName + "'")
 	}
+	insCnt := 0
 	for {
 		fieldsSql = ""
 		rowStr, err = fpBuf.ReadString('\n')
+		rowStr = strings.TrimSpace(rowStr)
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -142,7 +152,20 @@ func main() {
 			}
 			fieldsSql += "\"" + field + "\""
 		}
-		query = "INSERT INTO " + opt.TableName + " VALUES (" + fieldsSql + ");"
+		if insCnt == 0 {
+			query = "INSERT INTO " + opt.TableName + " VALUES (" + fieldsSql + ")"
+		} else if insCnt == opt.RPI {
+			query += ";"
+			queryChan <- query
+			insCnt = 0
+			query = "INSERT INTO " + opt.TableName + " VALUES (" + fieldsSql + ")"
+		} else {
+			query += ",(" + fieldsSql + ")"
+		}
+			insCnt++
+	}
+	if len(query) > 0 {
+		query += ";"
 		queryChan <- query
 	}
 	close(queryChan)
