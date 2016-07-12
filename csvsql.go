@@ -2,7 +2,7 @@ package main
 
 import (
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/peterh/liner"
+	"github.com/chzyer/readline"
 	"github.com/niocs/sflag"
 	"path/filepath"
 	"encoding/hex"
@@ -22,6 +22,7 @@ var opt = struct {
 	Load      string    "CSV file to load"
 	MemDB     bool      "Create DB in :memory: instead of disk. Defaults to false"
 	AskType   bool      "Asks type for each field. Uses TEXT otherwise."
+	Type      string    "Comma separated field types. Can be TEXT/REAL/INTEGER."
 	TableName string    "Sqlite table name.  Default is t1.|t1"
 	RPI       int       "Rows per insert. Defaults to 100. Reduce if long rows.|100"
 	Query     string    "Query to run. If not provided, enters interactive mode"
@@ -35,6 +36,7 @@ func Usage() {
 Usage: csvsql  --Load    <csvfile>
               [--MemDB]             #Creates sqlite db in :memory: instead of disk.
               [--AskType]           #Asks type for each field. Uses TEXT otherwise.
+              [--Type  <type1>,...] #Comma separated field types. Can be TEXT/REAL/INTEGER.
               [--TableName]         #Sqlite table name.  Default is t1.
               [--Query]             #Query to run. If not provided, enters interactive mode.
               [--RPI]               #Rows per insert. Defaults to 100. Reduce if long rows.
@@ -42,9 +44,11 @@ Usage: csvsql  --Load    <csvfile>
               [--OutDelim]          #Output Delimiter to use. Defaults is comma.
               [--WorkDir <workdir>] #tmp dir to create db in. Defaults to /tmp/. 
 The --WorkDir parameter is ignored if --MemDB is specified.
+The --AskType parameter is ignored if --Type  is specified.
 The --OutFile parameter is ignored if --Query is NOT specified.
 `)
 }
+
 
 func TempFileName(_basedir, prefix string) (string,string) {
 	randBytes := make([]byte, 8)
@@ -79,6 +83,81 @@ func InsertToDB(db *sql.DB,queries <-chan string, done chan<- bool) {
 	}
 }
 
+func SetType(headerStr string) (fieldsSql string, quoteField []bool, fieldTypes []byte) {
+	header := strings.Split(headerStr, ",")
+	types  := strings.Split(opt.Type,  ",")
+	for ii, field := range(header) {
+		if len(fieldsSql) > 0 {
+			fieldsSql += ","
+		}
+		typ := strings.ToUpper(types[ii])
+		if typ == "INTEGER" || typ == "REAL" {
+			fieldsSql += field + " " + typ
+		} else {
+			typ = "TEXT"
+			fieldsSql += field + " " + typ
+		}
+		if typ == "TEXT" {
+			fieldTypes = append(fieldTypes, 0)
+			quoteField = append(quoteField, true)
+		} else if typ == "INTEGER" {
+			fieldTypes = append(fieldTypes, 1)
+			quoteField = append(quoteField, false)
+		} else if typ == "REAL" {
+			fieldTypes = append(fieldTypes, 2)
+			quoteField = append(quoteField, false)
+		}
+	}
+	return fieldsSql, quoteField, fieldTypes
+}
+
+func AskType(headerStr string, rowStr string) (fieldsSql string, quoteField []bool, fieldTypes []byte) {
+	var completer = readline.NewPrefixCompleter(
+		readline.PcItem("TEXT"),
+		readline.PcItem("INTEGER"),
+		readline.PcItem("REAL"),
+	)
+	rl, err := readline.NewEx(&readline.Config{
+		AutoComplete: completer,
+		Prompt:       "Enter type (TAB for options): ",
+	})
+	if err != nil {
+		log.Println(err)
+		panic(err)
+	}
+	header := strings.Split(headerStr, ",")
+	value  := strings.Split(rowStr, ",")
+	for ii, field := range(header) {
+		fmt.Printf("Field: %s  (first value: %s)\n", field, value[ii])
+		fieldType, err := rl.Readline()
+		if err != nil {
+			log.Println(err)
+			panic(err)
+		}
+		fieldType = strings.ToUpper(strings.TrimSpace(fieldType))
+		if len(fieldsSql) > 0 {
+			fieldsSql += ","
+		}
+		if fieldType == "INTEGER" || fieldType == "REAL" {
+			fieldsSql += field + " " + fieldType
+		} else {
+			fieldType = "TEXT"
+			fieldsSql += field + " " + fieldType
+		}
+		if fieldType == "TEXT" {
+			fieldTypes = append(fieldTypes, 0)
+			quoteField = append(quoteField, true)
+		} else if fieldType == "INTEGER" {
+			fieldTypes = append(fieldTypes, 1)
+			quoteField = append(quoteField, false)
+		} else if fieldType == "REAL" {
+			fieldTypes = append(fieldTypes, 2)
+			quoteField = append(quoteField, false)
+		}
+	}
+	return fieldsSql, quoteField, fieldTypes
+}
+
 func main() {
 	sflag.Parse(&opt)
 	if _,err := os.Stat(opt.Load); os.IsNotExist(err) {
@@ -88,9 +167,11 @@ func main() {
 	}
 	var dbfile      string
 	var dbdir       string
+	var headerStr   string
 	var rowStr      string
 	var fieldsSql   string
-	var fieldNames  string
+	var quoteField  []bool
+	var fieldTypes  []byte
 	var query       string
 	var interactiveMode = len(opt.Query) == 0
 	var queryChan       = make(chan string, 500)
@@ -116,18 +197,35 @@ func main() {
 		panic(err)
 	}
 	fpBuf := bufio.NewReader(fp)
-	rowStr, err = fpBuf.ReadString('\n')
+	headerStr, err = fpBuf.ReadString('\n')
+	headerStr = strings.TrimSuffix(headerStr,"\n")
 	if err != nil {
 		log.Println(err)
 		panic(err)
 	}
-	for _, field := range(strings.Split(rowStr, ",")) {
-		if len(fieldsSql) > 0 {
-			fieldsSql  += ","
-			fieldNames += ","
+	rowStr, err = fpBuf.ReadString('\n')
+	rowStr = strings.TrimSuffix(rowStr,"\n")
+	if err == io.EOF {
+		if len(rowStr) == 0 {
+			log.Println("No data rows")
+			os.Exit(1)
 		}
-		fieldsSql  += field + " TEXT"
-		fieldNames += field
+	} else if err != nil {
+		log.Println(err)
+		panic(err)
+	}
+	if len(opt.Type) > 0 {
+		fieldsSql, quoteField, fieldTypes = SetType(headerStr)
+	} else if opt.AskType {
+		fieldsSql, quoteField, fieldTypes = AskType(headerStr, rowStr)
+	} else {
+		for _, field := range(strings.Split(headerStr, ",")) {
+			if len(fieldsSql) > 0 {
+				fieldsSql  += ","
+			}
+			fieldsSql  += field + " TEXT"
+			quoteField = append(quoteField, true)
+		}
 	}
 	go InsertToDB(db, queryChan, doneChan)
 	query = fmt.Sprintf("CREATE TABLE %s (%s);",opt.TableName, fieldsSql)
@@ -138,19 +236,17 @@ func main() {
 	insCnt := 0
 	for {
 		fieldsSql = ""
-		rowStr, err = fpBuf.ReadString('\n')
-		rowStr = strings.TrimSpace(rowStr)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			log.Println(err)
-			panic(err)
-		}
-		for _, field := range(strings.Split(rowStr, ",")) {
+		for ii, field := range(strings.Split(rowStr, ",")) {
 			if len(fieldsSql) > 0 {
 				fieldsSql += ","
 			}
-			fieldsSql += "\"" + field + "\""
+			if quoteField[ii] {
+				fieldsSql += "\"" + field + "\""
+			} else {
+				field = strings.TrimSpace(field)
+				if field == "" { field = "NULL" }
+				fieldsSql += field
+			}
 		}
 		if insCnt == 0 {
 			query = "INSERT INTO " + opt.TableName + " VALUES (" + fieldsSql + ")"
@@ -162,7 +258,15 @@ func main() {
 		} else {
 			query += ",(" + fieldsSql + ")"
 		}
-			insCnt++
+		insCnt++
+		rowStr, err = fpBuf.ReadString('\n')
+		rowStr = strings.TrimSuffix(rowStr,"\n")
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Println(err)
+			panic(err)
+		}
 	}
 	if len(query) > 0 {
 		query += ";"
@@ -170,48 +274,92 @@ func main() {
 	}
 	close(queryChan)
 	<-doneChan
-	if interactiveMode { interactive(db) } else { execQuery(db) }
+	if interactiveMode { interactive(db, fieldTypes) } else { execQuery(db, fieldTypes) }
 }
 
-func execQuery(db *sql.DB) {
-	rows, err := db.Query(opt.Query)
-	if err != nil {
-		log.Println(err)
-		panic(err)
-	}
-	defer rows.Close()
+func printRows(fp *os.File, rows *sql.Rows, fieldTypes []byte) {
 	cols, err := rows.Columns()
-	if err != nil {
-		log.Println(err)
-		panic(err)
-	}
-	fp, err := os.Create(opt.OutFile)
 	if err != nil {
 		log.Println(err)
 		panic(err)
 	}
 	fmt.Fprintln(fp,strings.Join(cols, opt.OutDelim))
 	colLen  := len(cols)
-	rowData := make([]string, colLen)
-	rowInt  := make([]interface{}, colLen)
-	for ii := 0; ii < colLen; ii ++ { rowInt[ii] = &rowData[ii] }
+	rowStr  := make([]sql.NullString, colLen)
+	rowInt  := make([]sql.NullInt64,  colLen)
+	rowReal := make([]sql.NullFloat64, colLen)
+	rowIface  := make([]interface{}, colLen)
+	for ii := 0; ii < colLen; ii ++ {
+		if fieldTypes[ii] == 0 {            //TEXT
+			rowIface[ii] = &rowStr[ii]
+		} else if fieldTypes[ii] == 1 {     //INTEGER
+			rowIface[ii] = &rowInt[ii]
+		} else if fieldTypes[ii] == 2 {     //REAL
+			rowIface[ii] = &rowReal[ii]
+		}
+	}
 	for rows.Next() {
-		rows.Scan(rowInt...)
-		fmt.Fprintln(fp,strings.Join(rowData, opt.OutDelim))
+		rows.Scan(rowIface...)
+		for ii := 0; ii < colLen; ii ++ {
+			if ii > 0 { fmt.Fprint(fp,opt.OutDelim) }
+			if fieldTypes[ii] == 0 {            //TEXT
+				v, err := rowStr[ii].Value()
+				if err != nil {
+					log.Println(err)
+					panic(err)
+				}
+				if v != nil { fmt.Fprint(fp, v) }
+			} else if fieldTypes[ii] == 1 {     //INTEGER
+				v, err := rowInt[ii].Value()
+				if err != nil {
+					log.Println(err)
+					panic(err)
+				}
+				if v != nil { fmt.Fprint(fp, v) }
+			} else if fieldTypes[ii] == 2 {     //REAL
+				v, err := rowReal[ii].Value()
+				if err != nil {
+					log.Println(err)
+					panic(err)
+				}
+				if v != nil { fmt.Fprint(fp, v) }
+			}
+		}
+		fmt.Fprintln(fp)
+//		fmt.Fprintln(fp,strings.Join(rowData, opt.OutDelim))
 	}
 }
 
-func interactive(db *sql.DB) {
-	line := liner.NewLiner()
-	line.SetCtrlCAborts(true)
+func execQuery(db *sql.DB, fieldTypes []byte) {
+	rows, err := db.Query(opt.Query)
+	if err != nil {
+		log.Println(err)
+		panic(err)
+	}
+	defer rows.Close()
+	fp, err := os.Create(opt.OutFile)
+	if err != nil {
+		log.Println(err)
+		panic(err)
+	}
+	printRows(fp,rows,fieldTypes)
+}
+
+func interactive(db *sql.DB, fieldTypes []byte) {
+	line,err := readline.New("sql> ")
+	if err != nil {
+		log.Println(err)
+		panic(err)
+	}
 
 	fmt.Println("Type \\q to exit")
 	for {
-		query, err := line.Prompt("sql>")
+		query, err := line.Readline()
 		if err != nil {
 			log.Println(err)
 			panic(err)
 		}
+		if query == "" {continue}
 		if query == "\\q" {break}
 		rows, err := db.Query(query)
 		if err != nil {
@@ -219,20 +367,7 @@ func interactive(db *sql.DB) {
 			panic(err)
 		}
 		defer rows.Close()
-		cols, err := rows.Columns()
-		if err != nil {
-			log.Println(err)
-			panic(err)
-		}
-		fmt.Println(strings.Join(cols, opt.OutDelim))
-		colLen  := len(cols)
-		rowData := make([]string, colLen)
-		rowInt  := make([]interface{}, colLen)
-		for ii := 0; ii < colLen; ii ++ { rowInt[ii] = &rowData[ii] }
-		for rows.Next() {
-			rows.Scan(rowInt...)
-			fmt.Println(strings.Join(rowData, opt.OutDelim))
-		}
+		printRows(os.Stdin, rows, fieldTypes)
 	}
 
 }
