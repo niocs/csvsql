@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"math/rand"
 	"io/ioutil"
+	"os/signal"
+	"os/user"
 	"strings"
 	"bufio"
 	"fmt"
@@ -23,7 +25,7 @@ var opt = struct {
 	MemDB     bool      "Create DB in :memory: instead of disk. Defaults to false"
 	AskType   bool      "Asks type for each field. Uses TEXT otherwise."
 	Type      string    "Comma separated field types. Can be TEXT/REAL/INTEGER."
-	TableName string    "Sqlite table name.  Default is t1.|t1"
+	TableName string    "Sqlite table name.  Default is csv filename."
 	RPI       int       "Rows per insert. Defaults to 100. Reduce if long rows.|100"
 	Query     string    "Query to run. If not provided, enters interactive mode"
 	OutFile   string    "File to write csv output to. Defaults to stdout.|/dev/stdout"
@@ -37,7 +39,7 @@ Usage: csvsql  --Load    <csvfile>
               [--MemDB]             #Creates sqlite db in :memory: instead of disk.
               [--AskType]           #Asks type for each field. Uses TEXT otherwise.
               [--Type  <type1>,...] #Comma separated field types. Can be TEXT/REAL/INTEGER.
-              [--TableName]         #Sqlite table name.  Default is t1.
+              [--TableName]         #Sqlite table name.  Default is csv filename.
               [--Query]             #Query to run. If not provided, enters interactive mode.
               [--RPI]               #Rows per insert. Defaults to 100. Reduce if long rows.
               [--OutFile]           #File to write csv output to. Defaults to stdout.
@@ -55,8 +57,7 @@ func TempFileName(_basedir, prefix string) (string,string) {
 	rand.Read(randBytes)
 	tmpDir, err := ioutil.TempDir(_basedir, prefix)
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
     return tmpDir, filepath.Join(tmpDir, prefix + hex.EncodeToString(randBytes))
 }
@@ -64,16 +65,14 @@ func TempFileName(_basedir, prefix string) (string,string) {
 func InsertToDB(db *sql.DB,queries <-chan string, done chan<- bool) {
 	tx, err := db.Begin()
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	for {
 		query, more := <-queries
 		if more {
 			_, err := tx.Exec(query)
 			if err != nil {
-				log.Println(err)
-				panic(err)
+				log.Panic(err)
 			}
 		} else {
 			tx.Commit()
@@ -122,8 +121,7 @@ func AskType(headerStr string, rowStr string) (fieldsSql string, quoteField []bo
 		Prompt:       "Enter type (TAB for options): ",
 	})
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	header := strings.Split(headerStr, ",")
 	value  := strings.Split(rowStr, ",")
@@ -131,8 +129,7 @@ func AskType(headerStr string, rowStr string) (fieldsSql string, quoteField []bo
 		fmt.Printf("Field: %s  (first value: %s)\n", field, value[ii])
 		fieldType, err := rl.Readline()
 		if err != nil {
-			log.Println(err)
-			panic(err)
+			log.Panic(err)
 		}
 		fieldType = strings.ToUpper(strings.TrimSpace(fieldType))
 		if len(fieldsSql) > 0 {
@@ -186,22 +183,19 @@ func main() {
 
 	db, err := sql.Open("sqlite3", dbfile)
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	defer db.Close()
 	
 	fp, err := os.Open(opt.Load)
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	fpBuf := bufio.NewReader(fp)
 	headerStr, err = fpBuf.ReadString('\n')
 	headerStr = strings.TrimSuffix(headerStr,"\n")
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	rowStr, err = fpBuf.ReadString('\n')
 	rowStr = strings.TrimSuffix(rowStr,"\n")
@@ -211,8 +205,7 @@ func main() {
 			os.Exit(1)
 		}
 	} else if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	if len(opt.Type) > 0 {
 		fieldsSql, quoteField, fieldTypes = SetType(headerStr)
@@ -226,6 +219,9 @@ func main() {
 			fieldsSql  += field + " TEXT"
 			quoteField = append(quoteField, true)
 		}
+	}
+	if len(opt.TableName) == 0 {
+		opt.TableName = strings.Split(filepath.Base(opt.Load), ".")[0]
 	}
 	go InsertToDB(db, queryChan, doneChan)
 	query = fmt.Sprintf("CREATE TABLE %s (%s);",opt.TableName, fieldsSql)
@@ -264,8 +260,7 @@ func main() {
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			log.Println(err)
-			panic(err)
+			log.Panic(err)
 		}
 	}
 	if len(query) > 0 {
@@ -280,9 +275,17 @@ func main() {
 func printRows(fp *os.File, rows *sql.Rows, fieldTypes []byte) {
 	cols, err := rows.Columns()
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
+	CtrlC := make(chan os.Signal, 2)
+	signal.Notify(CtrlC, os.Interrupt)
+	var stopPrinting = false
+	go func() {
+		_, ok := <-CtrlC
+		if ok {
+			stopPrinting = true
+		}
+	}()
 	fmt.Fprintln(fp,strings.Join(cols, opt.OutDelim))
 	colLen  := len(cols)
 	rowStr  := make([]sql.NullString, colLen)
@@ -305,69 +308,87 @@ func printRows(fp *os.File, rows *sql.Rows, fieldTypes []byte) {
 			if fieldTypes[ii] == 0 {            //TEXT
 				v, err := rowStr[ii].Value()
 				if err != nil {
-					log.Println(err)
-					panic(err)
+					log.Panic(err)
 				}
 				if v != nil { fmt.Fprint(fp, v) }
 			} else if fieldTypes[ii] == 1 {     //INTEGER
 				v, err := rowInt[ii].Value()
 				if err != nil {
-					log.Println(err)
-					panic(err)
+					log.Panic(err)
 				}
 				if v != nil { fmt.Fprint(fp, v) }
 			} else if fieldTypes[ii] == 2 {     //REAL
 				v, err := rowReal[ii].Value()
 				if err != nil {
-					log.Println(err)
-					panic(err)
+					log.Panic(err)
 				}
 				if v != nil { fmt.Fprint(fp, v) }
 			}
 		}
 		fmt.Fprintln(fp)
-//		fmt.Fprintln(fp,strings.Join(rowData, opt.OutDelim))
+		if stopPrinting { rows.Close(); break }
 	}
+	signal.Stop(CtrlC)
+	close(CtrlC)
 }
 
 func execQuery(db *sql.DB, fieldTypes []byte) {
 	rows, err := db.Query(opt.Query)
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	defer rows.Close()
 	fp, err := os.Create(opt.OutFile)
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 	printRows(fp,rows,fieldTypes)
 }
 
 func interactive(db *sql.DB, fieldTypes []byte) {
-	line,err := readline.New("sql> ")
+	usr, err := user.Current()
 	if err != nil {
-		log.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
+	rl,err := readline.NewEx(&readline.Config{
+		Prompt			: "sql> ",
+		HistoryFile		: usr.HomeDir + "/.csvsql.history",
+		DisableAutoSaveHistory	: true,
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+	defer rl.Close()
 
 	fmt.Println("Type \\q to exit")
+	var queryLines []string
 	for {
-		query, err := line.Readline()
-		if err != nil {
-			log.Println(err)
-			panic(err)
+		line, err := rl.Readline()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Panic(err)
 		}
-		if query == "" {continue}
-		if query == "\\q" {break}
+		line = strings.TrimSpace(line)
+		if len(line) == 0      { continue }
+		if line      == "\\q"  { break    }
+		if line      == "exit" { break    }
+
+		queryLines = append(queryLines,line)
+		if !strings.HasSuffix(line, ";") {
+			rl.SetPrompt(">>> ")
+			continue
+		}
+		query := strings.Join(queryLines, " ")
+		queryLines = queryLines[:0]
+		rl.SetPrompt("sql> ")
+		rl.SaveHistory(query)
 		rows, err := db.Query(query)
 		if err != nil {
-			log.Println(err)
-			panic(err)
+			fmt.Println(err)
+			continue
 		}
 		defer rows.Close()
 		printRows(os.Stdin, rows, fieldTypes)
 	}
-
 }
