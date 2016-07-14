@@ -218,6 +218,7 @@ func main() {
 			}
 			fieldsSql  += field + " TEXT"
 			quoteField = append(quoteField, true)
+			fieldTypes = append(fieldTypes, 0)
 		}
 	}
 	if len(opt.TableName) == 0 {
