@@ -365,7 +365,11 @@ func interactive(db *sql.DB, fieldTypes []byte) {
 	var queryLines []string
 	for {
 		line, err := rl.Readline()
-		if err == io.EOF {
+		if err == readline.ErrInterrupt {
+			queryLines = queryLines[:0]
+			rl.SetPrompt("sql> ")
+			continue
+		} else if err == io.EOF {
 			break
 		} else if err != nil {
 			log.Panic(err)
