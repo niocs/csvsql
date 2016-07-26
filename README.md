@@ -4,11 +4,11 @@ Golang project to run sql queries on any csv file using embedded sqlite database
 
 The best way to install is to use the go command:
 
-    `$ go get github.com/niocs/csvsql`
+    $ go get github.com/niocs/csvsql
 
 Then add the following line to your .bashrc or .zshrc, etc.
 
-    `export PATH=$GOPATH/bin:$PATH`
+    export PATH=$GOPATH/bin:$PATH
 
 ```
 Usage: csvsql  --Load    <csvfile>
