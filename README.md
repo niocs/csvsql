@@ -6,7 +6,7 @@ The best way to install is to use the go command:
 
     $ go get github.com/niocs/csvsql
 
-Then add the following line to your .bashrc or .zshrc, etc.
+Then add the following line at the end of your .bashrc or .zshrc, etc.
 
     export PATH=$GOPATH/bin:$PATH
 
